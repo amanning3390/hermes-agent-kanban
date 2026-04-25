@@ -13,10 +13,10 @@ index 5d30f244..e3033779 100644
          )
 diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
 new file mode 100644
-index 00000000..cf04bd16
+index 00000000..41193809
 --- /dev/null
 +++ b/hermes_cli/kanban.py
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,543 @@
 +"""Native Hermes Kanban board backend.
 +
 +The board is deliberately scoped to Hermes concepts: cards launch Hermes
@@ -39,7 +39,7 @@ index 00000000..cf04bd16
 +from fastapi import APIRouter, HTTPException
 +from pydantic import BaseModel, Field, field_validator
 +
-+from hermes_cli.config import get_hermes_home
++from hermes_cli.config import get_compatible_custom_providers, get_hermes_home, load_config
 +
 +ColumnId = Literal["backlog", "running", "review", "done", "trash"]
 +TaskStatus = Literal["idle", "running", "review", "done", "failed", "stopped"]
@@ -99,6 +99,7 @@ index 00000000..cf04bd16
 +    id: str = Field(default_factory=_new_id)
 +    title: str
 +    prompt: str
++    model: str | None = None
 +    column: ColumnId = "backlog"
 +    status: TaskStatus = "idle"
 +    workspace_path: str | None = None
@@ -119,6 +120,13 @@ index 00000000..cf04bd16
 +            raise ValueError("value must not be blank")
 +        return trimmed
 +
++    @field_validator("model")
++    @classmethod
++    def _empty_model_to_none(cls, value: str | None) -> str | None:
++        if value is None:
++            return None
++        return value.strip() or None
++
 +
 +class KanbanBoard(BaseModel):
 +    version: int = 1
@@ -130,11 +138,15 @@ index 00000000..cf04bd16
 +    board: KanbanBoard
 +    columns: list[dict[str, str]]
 +    default_workspace_path: str
++    active_model: str
++    active_provider: str
++    model_options: list[str]
 +
 +
 +class CardCreateRequest(BaseModel):
 +    title: str = Field(min_length=1)
 +    prompt: str = Field(min_length=1)
++    model: str | None = None
 +    workspace_path: str | None = None
 +
 +    @field_validator("title", "prompt")
@@ -145,10 +157,18 @@ index 00000000..cf04bd16
 +            raise ValueError("value must not be blank")
 +        return trimmed
 +
++    @field_validator("model")
++    @classmethod
++    def _empty_model_to_none(cls, value: str | None) -> str | None:
++        if value is None:
++            return None
++        return value.strip() or None
++
 +
 +class CardUpdateRequest(BaseModel):
 +    title: str | None = None
 +    prompt: str | None = None
++    model: str | None = None
 +    column: ColumnId | None = None
 +    workspace_path: str | None = None
 +
@@ -162,9 +182,24 @@ index 00000000..cf04bd16
 +            raise ValueError("value must not be blank")
 +        return trimmed
 +
++    @field_validator("model")
++    @classmethod
++    def _empty_model_to_none(cls, value: str | None) -> str | None:
++        if value is None:
++            return None
++        return value.strip() or None
++
 +
 +class CardStartRequest(BaseModel):
 +    workspace_path: str | None = None
++    model: str | None = None
++
++    @field_validator("model")
++    @classmethod
++    def _empty_model_to_none(cls, value: str | None) -> str | None:
++        if value is None:
++            return None
++        return value.strip() or None
 +
 +
 +class CardLogResponse(BaseModel):
@@ -239,6 +274,45 @@ index 00000000..cf04bd16
 +    return path
 +
 +
++def _configured_model_info() -> tuple[str, str]:
++    config = load_config()
++    model_config = config.get("model", "")
++    if isinstance(model_config, dict):
++        model = str(model_config.get("default") or model_config.get("model") or model_config.get("name") or "")
++        provider = str(model_config.get("provider") or "")
++    else:
++        model = str(model_config or "")
++        provider = ""
++    provider = provider or os.getenv("HERMES_INFERENCE_PROVIDER", "auto")
++    return model, provider
++
++
++def _model_options(active_model: str, active_provider: str) -> list[str]:
++    options: list[str] = []
++
++    def add(model: Any) -> None:
++        value = str(model or "").strip()
++        if value and value not in options:
++            options.append(value)
++
++    add(active_model)
++    try:
++        from hermes_cli.models import _PROVIDER_MODELS
++        for model in _PROVIDER_MODELS.get(active_provider, [])[:40]:
++            add(model)
++    except Exception:
++        pass
++
++    try:
++        config = load_config()
++        for entry in get_compatible_custom_providers(config):
++            add(entry.get("model"))
++    except Exception:
++        pass
++
++    return options
++
++
 +def _finish_card(card_id: str, return_code: int) -> None:
 +    with _RUNNING_LOCK:
 +        _RUNNING.pop(card_id, None)
@@ -299,10 +373,14 @@ index 00000000..cf04bd16
 +
 +@router.get("/board", response_model=BoardResponse)
 +async def get_board() -> BoardResponse:
++    active_model, active_provider = _configured_model_info()
 +    return BoardResponse(
 +        board=store.load(),
 +        columns=COLUMNS,
 +        default_workspace_path=_default_workspace(),
++        active_model=active_model,
++        active_provider=active_provider,
++        model_options=_model_options(active_model, active_provider),
 +    )
 +
 +
@@ -311,7 +389,12 @@ index 00000000..cf04bd16
 +    workspace = body.workspace_path.strip() if body.workspace_path else None
 +    if workspace:
 +        _workspace_path(workspace)
-+    card = KanbanCard(title=body.title, prompt=body.prompt, workspace_path=workspace)
++    card = KanbanCard(
++        title=body.title,
++        prompt=body.prompt,
++        model=body.model,
++        workspace_path=workspace,
++    )
 +    return store.upsert_card(card)
 +
 +
@@ -324,6 +407,8 @@ index 00000000..cf04bd16
 +        card.title = body.title
 +    if body.prompt is not None:
 +        card.prompt = body.prompt
++    if "model" in body.model_fields_set:
++        card.model = body.model
 +    if body.column is not None:
 +        card.column = body.column
 +        if body.column == "done":
@@ -354,6 +439,7 @@ index 00000000..cf04bd16
 +
 +    workspace_raw = body.workspace_path or card.workspace_path or _default_workspace()
 +    workspace = _workspace_path(workspace_raw)
++    model = body.model or card.model
 +    log_path = _logs_dir() / f"{card.id}-{int(_now())}.log"
 +    command = [
 +        sys.executable,
@@ -363,9 +449,13 @@ index 00000000..cf04bd16
 +        "-Q",
 +        "--source",
 +        "kanban",
++    ]
++    if model:
++        command.extend(["--model", model])
++    command.extend([
 +        "-q",
 +        card.prompt,
-+    ]
++    ])
 +    env = os.environ.copy()
 +    env.setdefault("HERMES_ACCEPT_HOOKS", "1")
 +
@@ -394,6 +484,7 @@ index 00000000..cf04bd16
 +    card.status = "running"
 +    card.column = "running"
 +    card.workspace_path = str(workspace)
++    card.model = model
 +    card.pid = process.pid
 +    card.log_path = str(log_path)
 +    card.started_at = _now()
@@ -853,10 +944,10 @@ index f405cf8b..a05df703 100644
 -
 diff --git a/tests/test_kanban.py b/tests/test_kanban.py
 new file mode 100644
-index 00000000..3917958b
+index 00000000..607444e8
 --- /dev/null
 +++ b/tests/test_kanban.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,250 @@
 +import asyncio
 +import subprocess
 +from pathlib import Path
@@ -902,6 +993,40 @@ index 00000000..3917958b
 +
 +    assert card.workspace_path == str(workspace)
 +    assert kanban.store.load().cards[0].id == card.id
++
++
++def test_create_card_stores_trimmed_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
++    monkeypatch.setattr(kanban, "store", KanbanStore(tmp_path / "board.json"))
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++
++    card = asyncio.run(kanban.create_card(
++        CardCreateRequest(
++            title="Model task",
++            prompt="Run on a specific model",
++            model=" anthropic/claude-sonnet-4.6 ",
++            workspace_path=str(workspace),
++        )
++    ))
++
++    assert card.model == "anthropic/claude-sonnet-4.6"
++    assert kanban.store.load().cards[0].model == "anthropic/claude-sonnet-4.6"
++
++
++def test_update_card_clears_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
++    monkeypatch.setattr(kanban, "store", KanbanStore(tmp_path / "board.json"))
++    card = kanban.store.upsert_card(
++        KanbanCard(
++            title="Switch back",
++            prompt="Use the dashboard default again",
++            model="anthropic/claude-sonnet-4.6",
++        )
++    )
++
++    updated = asyncio.run(kanban.update_card(card.id, CardUpdateRequest(model="")))
++
++    assert updated.model is None
++    assert kanban.store.load().cards[0].model is None
 +
 +
 +def test_create_card_rejects_missing_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -976,6 +1101,81 @@ index 00000000..3917958b
 +    assert updated.status == "failed"
 +    assert updated.column == "review"
 +    assert updated.error == "boom"
++
++
++def test_start_card_passes_model_to_chat_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
++    monkeypatch.setattr(kanban, "store", KanbanStore(tmp_path / "board.json"))
++    monkeypatch.setattr(kanban, "get_hermes_home", lambda: tmp_path / "hermes-home")
++    workspace = tmp_path / "workspace"
++    workspace.mkdir()
++    card = kanban.store.upsert_card(
++        KanbanCard(
++            title="Launch with model",
++            prompt="Use the selected model",
++            model="anthropic/claude-sonnet-4.6",
++            workspace_path=str(workspace),
++        )
++    )
++    captured: dict[str, object] = {}
++
++    class FakeProcess:
++        pid = 4321
++
++        def poll(self):
++            return None
++
++        def wait(self):
++            return 0
++
++    class NoopThread:
++        def __init__(self, *_args, **_kwargs):
++            pass
++
++        def start(self):
++            pass
++
++    def fake_popen(command, **kwargs):
++        captured["command"] = command
++        captured["cwd"] = kwargs["cwd"]
++        return FakeProcess()
++
++    monkeypatch.setattr(kanban.subprocess, "Popen", fake_popen)
++    monkeypatch.setattr(kanban.threading, "Thread", NoopThread)
++
++    updated = asyncio.run(kanban.start_card(card.id, CardStartRequest()))
++
++    command = captured["command"]
++    assert isinstance(command, list)
++    assert command[command.index("--model") + 1] == "anthropic/claude-sonnet-4.6"
++    assert command[command.index("-q") + 1] == "Use the selected model"
++    assert captured["cwd"] == str(workspace)
++    assert updated.status == "running"
++    assert updated.model == "anthropic/claude-sonnet-4.6"
++
++
++def test_board_exposes_configured_model_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
++    monkeypatch.setattr(kanban, "store", KanbanStore(tmp_path / "board.json"))
++
++    def fake_load_config():
++        return {
++            "model": {"provider": "nous", "default": "nous/deephermes-3-mistral-24b-preview"},
++            "providers": {
++                "local": {
++                    "name": "Local",
++                    "base_url": "http://localhost:1234/v1",
++                    "model": "local/hermes",
++                }
++            },
++        }
++
++    monkeypatch.setattr(kanban, "load_config", fake_load_config)
++
++    response = asyncio.run(kanban.get_board())
++
++    assert response.active_provider == "nous"
++    assert response.active_model == "nous/deephermes-3-mistral-24b-preview"
++    assert "nous/deephermes-3-mistral-24b-preview" in response.model_options
++    assert "local/hermes" in response.model_options
 +
 +
 +def test_finish_does_not_overwrite_stopped_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1079,7 +1279,7 @@ index dc67cd82..023d1efd 100644
        logs: "日志",
        sessions: "会话",
 diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
-index b4790f26..59f7cee6 100644
+index b4790f26..a2bb1d9b 100644
 --- a/web/src/lib/api.ts
 +++ b/web/src/lib/api.ts
 @@ -136,6 +136,46 @@ export const api = {
@@ -1088,7 +1288,7 @@ index b4790f26..59f7cee6 100644
  
 +  // Kanban
 +  getKanbanBoard: () => fetchJSON<KanbanBoardResponse>("/api/kanban/board"),
-+  createKanbanCard: (card: { title: string; prompt: string; workspace_path?: string }) =>
++  createKanbanCard: (card: { title: string; prompt: string; model?: string; workspace_path?: string }) =>
 +    fetchJSON<KanbanCard>("/api/kanban/cards", {
 +      method: "POST",
 +      headers: { "Content-Type": "application/json" },
@@ -1096,7 +1296,7 @@ index b4790f26..59f7cee6 100644
 +    }),
 +  updateKanbanCard: (
 +    id: string,
-+    card: Partial<Pick<KanbanCard, "title" | "prompt" | "column" | "workspace_path">>,
++    card: Partial<Pick<KanbanCard, "title" | "prompt" | "model" | "column" | "workspace_path">>,
 +  ) =>
 +    fetchJSON<KanbanCard>(`/api/kanban/cards/${encodeURIComponent(id)}`, {
 +      method: "PUT",
@@ -1107,11 +1307,11 @@ index b4790f26..59f7cee6 100644
 +    fetchJSON<{ ok: boolean }>(`/api/kanban/cards/${encodeURIComponent(id)}`, {
 +      method: "DELETE",
 +    }),
-+  startKanbanCard: (id: string, workspace_path?: string) =>
++  startKanbanCard: (id: string, workspace_path?: string, model?: string | null) =>
 +    fetchJSON<KanbanCard>(`/api/kanban/cards/${encodeURIComponent(id)}/start`, {
 +      method: "POST",
 +      headers: { "Content-Type": "application/json" },
-+      body: JSON.stringify({ workspace_path }),
++      body: JSON.stringify({ workspace_path, model }),
 +    }),
 +  stopKanbanCard: (id: string) =>
 +    fetchJSON<KanbanCard>(`/api/kanban/cards/${encodeURIComponent(id)}/stop`, {
@@ -1129,7 +1329,7 @@ index b4790f26..59f7cee6 100644
    // OAuth provider management
    getOAuthProviders: () =>
      fetchJSON<OAuthProvidersResponse>("/api/providers/oauth"),
-@@ -258,6 +298,57 @@ export interface StatusResponse {
+@@ -258,6 +298,61 @@ export interface StatusResponse {
    version: string;
  }
  
@@ -1145,6 +1345,7 @@ index b4790f26..59f7cee6 100644
 +  id: string;
 +  title: string;
 +  prompt: string;
++  model: string | null;
 +  column: KanbanColumnId;
 +  status: KanbanTaskStatus;
 +  workspace_path: string | null;
@@ -1168,6 +1369,9 @@ index b4790f26..59f7cee6 100644
 +  board: KanbanBoard;
 +  columns: KanbanColumn[];
 +  default_workspace_path: string;
++  active_model: string;
++  active_provider: string;
++  model_options: string[];
 +}
 +
 +export interface KanbanCardLogResponse {
@@ -1189,10 +1393,10 @@ index b4790f26..59f7cee6 100644
    source: string | null;
 diff --git a/web/src/pages/KanbanPage.tsx b/web/src/pages/KanbanPage.tsx
 new file mode 100644
-index 00000000..88ad3717
+index 00000000..b5321128
 --- /dev/null
 +++ b/web/src/pages/KanbanPage.tsx
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,662 @@
 +import { useCallback, useEffect, useMemo, useState } from "react";
 +import {
 +  AlertCircle,
@@ -1211,6 +1415,7 @@ index 00000000..88ad3717
 +  KanbanCard,
 +  KanbanCardDiffResponse,
 +  KanbanCardLogResponse,
++  KanbanBoardResponse,
 +  KanbanColumn,
 +  KanbanColumnId,
 +  KanbanTaskStatus,
@@ -1220,6 +1425,7 @@ index 00000000..88ad3717
 +import { Button } from "@/components/ui/button";
 +import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 +import { Input } from "@/components/ui/input";
++import { Select, SelectOption } from "@/components/ui/select";
 +
 +const STATUS_LABEL: Record<KanbanTaskStatus, string> = {
 +  idle: "Idle",
@@ -1259,6 +1465,40 @@ index 00000000..88ad3717
 +  );
 +}
 +
++function ModelSelect({
++  value,
++  onValueChange,
++  options,
++  activeModel,
++  disabled,
++  className,
++}: {
++  value: string;
++  onValueChange: (value: string) => void;
++  options: string[];
++  activeModel: string;
++  disabled?: boolean;
++  className?: string;
++}) {
++  const fallbackLabel = activeModel ? `Dashboard default (${activeModel})` : "Dashboard default";
++
++  return (
++    <Select
++      value={value}
++      onValueChange={onValueChange}
++      disabled={disabled}
++      className={className}
++    >
++      <SelectOption value="">{fallbackLabel}</SelectOption>
++      {options.map((option) => (
++        <SelectOption key={option} value={option}>
++          {option}
++        </SelectOption>
++      ))}
++    </Select>
++  );
++}
++
 +function BoardCard({
 +  card,
 +  selected,
@@ -1292,9 +1532,10 @@ index 00000000..88ad3717
 +        {card.prompt}
 +      </p>
 +      <div className="mt-3 flex items-center justify-between gap-2 text-[0.65rem] text-muted-foreground">
-+        <span className="min-w-0 truncate font-mono-ui">
-+          {card.workspace_path ?? "workspace unset"}
-+        </span>
++        <div className="min-w-0 space-y-1">
++          <div className="truncate font-mono-ui">{card.workspace_path ?? "workspace unset"}</div>
++          <div className="truncate font-mono-ui">{card.model ?? "dashboard default model"}</div>
++        </div>
 +        <span className="shrink-0">{timeAgo(card.updated_at)}</span>
 +      </div>
 +      {card.last_activity && (
@@ -1347,6 +1588,8 @@ index 00000000..88ad3717
 +  onSave,
 +  onMove,
 +  onDelete,
++  activeModel,
++  modelOptions,
 +}: {
 +  card: KanbanCard | null;
 +  diff: KanbanCardDiffResponse | null;
@@ -1355,19 +1598,16 @@ index 00000000..88ad3717
 +  onRefresh: () => void;
 +  onStart: () => void;
 +  onStop: () => void;
-+  onSave: (values: { title: string; prompt: string; workspace_path: string }) => void;
++  onSave: (values: { title: string; prompt: string; model: string; workspace_path: string }) => void;
 +  onMove: (column: KanbanColumnId) => void;
 +  onDelete: () => void;
++  activeModel: string;
++  modelOptions: string[];
 +}) {
-+  const [editTitle, setEditTitle] = useState("");
-+  const [editPrompt, setEditPrompt] = useState("");
-+  const [editWorkspace, setEditWorkspace] = useState("");
-+
-+  useEffect(() => {
-+    setEditTitle(card?.title ?? "");
-+    setEditPrompt(card?.prompt ?? "");
-+    setEditWorkspace(card?.workspace_path ?? "");
-+  }, [card?.id, card?.prompt, card?.title, card?.workspace_path]);
++  const [editTitle, setEditTitle] = useState(card?.title ?? "");
++  const [editPrompt, setEditPrompt] = useState(card?.prompt ?? "");
++  const [editModel, setEditModel] = useState(card?.model ?? "");
++  const [editWorkspace, setEditWorkspace] = useState(card?.workspace_path ?? "");
 +
 +  if (!card) {
 +    return (
@@ -1391,6 +1631,7 @@ index 00000000..88ad3717
 +            <div className="mt-2 flex flex-wrap items-center gap-2">
 +              <StatusBadge status={card.status} />
 +              {card.pid && <Badge variant="outline">PID {card.pid}</Badge>}
++              {card.model && <Badge variant="outline">{card.model}</Badge>}
 +            </div>
 +          </div>
 +          <Button size="icon" variant="ghost" onClick={onRefresh} disabled={busy} aria-label="Refresh card">
@@ -1420,6 +1661,13 @@ index 00000000..88ad3717
 +              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 +            )}
 +          />
++          <ModelSelect
++            value={editModel}
++            onValueChange={setEditModel}
++            options={modelOptions}
++            activeModel={activeModel}
++            disabled={card.status === "running"}
++          />
 +          <Input
 +            value={editWorkspace}
 +            onChange={(event) => setEditWorkspace(event.target.value)}
@@ -1438,6 +1686,7 @@ index 00000000..88ad3717
 +              onSave({
 +                title: editTitle,
 +                prompt: editPrompt,
++                model: editModel,
 +                workspace_path: editWorkspace,
 +              })
 +            }
@@ -1508,7 +1757,11 @@ index 00000000..88ad3717
 +  const [selectedId, setSelectedId] = useState<string | null>(null);
 +  const [title, setTitle] = useState("");
 +  const [prompt, setPrompt] = useState("");
++  const [model, setModel] = useState("");
 +  const [workspace, setWorkspace] = useState("");
++  const [activeModel, setActiveModel] = useState("");
++  const [activeProvider, setActiveProvider] = useState("");
++  const [modelOptions, setModelOptions] = useState<string[]>([]);
 +  const [error, setError] = useState<string | null>(null);
 +  const [busy, setBusy] = useState(false);
 +  const [log, setLog] = useState<KanbanCardLogResponse | null>(null);
@@ -1518,6 +1771,8 @@ index 00000000..88ad3717
 +    () => cards.find((card) => card.id === selectedId) ?? null,
 +    [cards, selectedId],
 +  );
++  const selectedLog = selectedCard && log?.card_id === selectedCard.id ? log : null;
++  const selectedDiff = selectedCard && diff?.card_id === selectedCard.id ? diff : null;
 +
 +  const groupedCards = useMemo(() => {
 +    const groups = new Map<KanbanColumnId, KanbanCard[]>();
@@ -1529,16 +1784,23 @@ index 00000000..88ad3717
 +    return groups;
 +  }, [cards, columns]);
 +
-+  const refreshBoard = useCallback(async () => {
-+    const response = await api.getKanbanBoard();
++  const applyBoardResponse = useCallback((response: KanbanBoardResponse) => {
 +    setColumns(response.columns);
 +    setCards(response.board.cards);
 +    setDefaultWorkspace(response.default_workspace_path);
++    setActiveModel(response.active_model);
++    setActiveProvider(response.active_provider);
++    setModelOptions(response.model_options);
 +    setWorkspace((current) => current || response.default_workspace_path);
 +    if (!selectedId && response.board.cards.length > 0) {
 +      setSelectedId(response.board.cards[0].id);
 +    }
 +  }, [selectedId]);
++
++  const refreshBoard = useCallback(async () => {
++    const response = await api.getKanbanBoard();
++    applyBoardResponse(response);
++  }, [applyBoardResponse]);
 +
 +  const refreshDetail = useCallback(async (cardId: string) => {
 +    const [nextLog, nextDiff] = await Promise.all([
@@ -1562,17 +1824,39 @@ index 00000000..88ad3717
 +  }, []);
 +
 +  useEffect(() => {
-+    runAction(refreshBoard);
-+  }, [refreshBoard, runAction]);
++    let cancelled = false;
++    api
++      .getKanbanBoard()
++      .then((response) => {
++        if (!cancelled) applyBoardResponse(response);
++      })
++      .catch((err) => {
++        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [applyBoardResponse]);
 +
 +  useEffect(() => {
-+    if (!selectedCard) {
-+      setLog(null);
-+      setDiff(null);
-+      return;
-+    }
-+    runAction(() => refreshDetail(selectedCard.id));
-+  }, [selectedCard?.id, refreshDetail, runAction]);
++    if (!selectedId) return;
++    let cancelled = false;
++    Promise.all([
++      api.getKanbanCardLog(selectedId),
++      api.getKanbanCardDiff(selectedId),
++    ])
++      .then(([nextLog, nextDiff]) => {
++        if (cancelled) return;
++        setLog(nextLog);
++        setDiff(nextDiff);
++      })
++      .catch((err) => {
++        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [selectedId]);
 +
 +  useEffect(() => {
 +    if (!cards.some((card) => card.status === "running")) return;
@@ -1595,6 +1879,7 @@ index 00000000..88ad3717
 +          <H2 className="blend-lighter">Kanban</H2>
 +          <div className="mt-1 text-xs normal-case tracking-normal text-muted-foreground">
 +            {cards.length} cards · {cards.filter((card) => card.status === "running").length} running
++            {activeModel && <> · {activeProvider}/{activeModel}</>}
 +          </div>
 +        </div>
 +        <Button variant="outline" onClick={() => runAction(refreshBoard)} disabled={busy}>
@@ -1613,7 +1898,7 @@ index 00000000..88ad3717
 +        <CardHeader>
 +          <CardTitle>New Card</CardTitle>
 +        </CardHeader>
-+        <CardContent className="grid gap-3 lg:grid-cols-[1fr_1.6fr_1fr_auto]">
++        <CardContent className="grid gap-3 lg:grid-cols-[1fr_1.6fr_1fr_1fr_auto]">
 +          <Input
 +            value={title}
 +            onChange={(event) => setTitle(event.target.value)}
@@ -1630,6 +1915,12 @@ index 00000000..88ad3717
 +              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 +            )}
 +          />
++          <ModelSelect
++            value={model}
++            onValueChange={setModel}
++            options={modelOptions}
++            activeModel={activeModel}
++          />
 +          <Input
 +            value={workspace}
 +            onChange={(event) => setWorkspace(event.target.value)}
@@ -1643,12 +1934,14 @@ index 00000000..88ad3717
 +                const card = await api.createKanbanCard({
 +                  title,
 +                  prompt,
++                  model: model || undefined,
 +                  workspace_path: workspace || defaultWorkspace,
 +                });
 +                setCards((current) => [card, ...current]);
 +                setSelectedId(card.id);
 +                setTitle("");
 +                setPrompt("");
++                setModel("");
 +              })
 +            }
 +          >
@@ -1678,7 +1971,11 @@ index 00000000..88ad3717
 +                      onSelect={() => setSelectedId(card.id)}
 +                      onStart={() =>
 +                        runAction(async () => {
-+                          const updated = await api.startKanbanCard(card.id, card.workspace_path ?? workspace);
++                          const updated = await api.startKanbanCard(
++                            card.id,
++                            card.workspace_path ?? workspace,
++                            card.model,
++                          );
 +                          replaceCard(updated);
 +                          await refreshDetail(updated.id);
 +                        })
@@ -1699,9 +1996,10 @@ index 00000000..88ad3717
 +        </div>
 +
 +        <DetailPanel
++          key={selectedCard?.id ?? "empty"}
 +          card={selectedCard}
-+          log={log}
-+          diff={diff}
++          log={selectedLog}
++          diff={selectedDiff}
 +          busy={busy}
 +          onRefresh={() =>
 +            selectedCard &&
@@ -1716,6 +2014,7 @@ index 00000000..88ad3717
 +              const updated = await api.startKanbanCard(
 +                selectedCard.id,
 +                selectedCard.workspace_path ?? workspace,
++                selectedCard.model,
 +              );
 +              replaceCard(updated);
 +              await refreshDetail(updated.id);
@@ -1753,6 +2052,8 @@ index 00000000..88ad3717
 +              setSelectedId(null);
 +            })
 +          }
++          activeModel={activeModel}
++          modelOptions={modelOptions}
 +        />
 +      </div>
 +    </div>
@@ -1760,10 +2061,10 @@ index 00000000..88ad3717
 +}
 diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
 new file mode 100644
-index 00000000..70d194d7
+index 00000000..35d55905
 --- /dev/null
 +++ b/website/docs/user-guide/features/kanban.md
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,47 @@
 +# Kanban
 +
 +The Kanban dashboard tab lets you queue and monitor Hermes work from the web UI. Cards are native Hermes tasks: starting a card runs `hermes chat` in the selected workspace, records the task log under your Hermes home directory, and moves the card to review when the process exits.
@@ -1774,7 +2075,9 @@ index 00000000..70d194d7
 +hermes dashboard
 +```
 +
-+Open the **Kanban** tab, enter a title, prompt, and workspace path, then click **Add**. The workspace path must point to an existing directory.
++Open the **Kanban** tab, enter a title, prompt, optional model override, and workspace path, then click **Add**. The workspace path must point to an existing directory.
++
++The model selector defaults to the dashboard's active Hermes model. Choosing a model on a card stores that override with the card and passes it to `hermes chat --model` whenever the card starts.
 +
 +## Card Lifecycle
 +

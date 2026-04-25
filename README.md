@@ -8,6 +8,7 @@ This repository is intentionally standalone. It is not a mirror of `nousresearch
 
 - `backend/hermes_cli/kanban.py`: FastAPI routes and persistent board storage for Kanban cards.
 - `frontend/web/src/pages/KanbanPage.tsx`: Hermes-styled React page for the dashboard tab.
+- `frontend/web/src/lib/api.ts`: dashboard API client types and Kanban request helpers.
 - `tests/test_kanban.py`: focused backend tests for card storage, validation, process handling, and git diff/status behavior.
 - `docs/kanban.md`: user-facing Kanban documentation for the Hermes docs site.
 - `patches/hermes-agent-kanban.patch`: complete patch against current Hermes Agent `main`.
@@ -39,9 +40,9 @@ npm --prefix web run build
 
 ## Feature Summary
 
-- Create cards with title, prompt, and workspace path.
+- Create cards with title, prompt, model override, and workspace path.
 - Move cards through Backlog, Running, Review, Done, and Trash.
-- Start a card as a Hermes CLI chat task using the card prompt.
+- Start a card as a Hermes CLI chat task using the card prompt and selected model.
 - Stop running card processes from the dashboard.
 - View per-card logs and workspace git diffs.
 - Persist board state under the active Hermes home directory.
